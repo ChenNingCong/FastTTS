@@ -1,0 +1,3 @@
+[submodule "reference/kokoro"]
+	path = reference/kokoro
+	url = https://github.com/hexgrad/kokoro.git
