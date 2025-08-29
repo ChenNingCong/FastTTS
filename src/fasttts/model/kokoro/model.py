@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
 from transformers import AlbertConfig
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, List
 import json
 import torch
 
@@ -116,6 +116,56 @@ class KModel(torch.nn.Module):
         t_en = self.text_encoder(input_ids, input_lengths, text_mask)
         asr = t_en @ pred_aln_trg
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze()
+        return audio, pred_dur
+    
+    @torch.no_grad()
+    def forward_with_tokens_batched(
+        self,
+        input_ids: List[torch.LongTensor],
+        ref_s: torch.FloatTensor,
+        speed: float = 1
+    ) -> tuple[torch.FloatTensor, torch.LongTensor]:
+        assert len(input_ids) > 0 
+        assert len(input_ids) == ref_s.shape[0]
+
+        # 1. Pad the list of tensors to a uniform length
+        input_lengths = torch.tensor([len(t) for t in input_ids], device=input_ids[0].device, dtype=torch.long)
+        max_len = input_lengths.max().item()
+
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids,
+            batch_first=True,
+            padding_value=0
+        )
+
+        # 2. Correctly create the padding mask
+        # C : 512, C0 : 128, C2 : 50, L0 : expanded duration 
+        text_mask = torch.arange(max_len).unsqueeze(0).to(self.device)
+        text_mask = text_mask.expand(len(input_ids), -1)
+        text_mask = torch.gt(text_mask, input_lengths.unsqueeze(1) - 1)
+        
+        bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
+        d_en = self.bert_encoder(bert_dur).transpose(-1, -2) # (B, C, L)
+        s = ref_s[:, 128:] # (B, C0)
+        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask) # (B, L, C + C0)
+        # d : [batch_size, max_seq_len, hidden_size]
+        x, _ = self.predictor.lstm(d) # (B, L, C)
+        duration = self.predictor.duration_proj(x) # (B, L, C2)
+        duration = torch.sigmoid(duration).sum(axis=-1) / speed # (B, L)
+        pred_dur = torch.round(duration).clamp(min=1).long() # (B, L)
+        # indices = torch.repeat_interleave(torch.arange(input_ids.shape[1], device=self.device), pred_dur)
+        indices = [torch.repeat_interleave(torch.arange(input_lengths[i].item(), device=self.device), pred_dur[i][:input_lengths[i].item()]) for i in range(input_ids.shape[0])] # (B, L0)
+        max_indice_len = max([len(i) for i in indices])    
+        pred_aln_trg = torch.zeros((*input_ids.shape, max_indice_len), device=self.device)  # (B, L, L0)
+        for i in range(input_ids.shape[0]):
+            pred_aln_trg[i, indices[i], torch.arange(len(indices[i]))] = 1
+            # pred_aln_trg = pred_aln_trg.unsqueeze(0).to(self.device)
+        # pred_aln_trg : [batch_size, max_seq_len, max_indice_len]
+        en = torch.bmm(d.transpose(-1, -2), pred_aln_trg) # (B, C+C0, L0)
+        F0_pred, N_pred = self.predictor.F0Ntrain(en, s) # (B, 2*L0), (B, 2*L0)
+        t_en = self.text_encoder(input_ids, input_lengths, text_mask) # (B, C, L)
+        asr = t_en @ pred_aln_trg # (B, C, L0)
+        audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze(1)
         return audio, pred_dur
 
     def forward(
