@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from functools import partial
 
 # https://github.com/yl4579/StyleTTS2/blob/main/Modules/utils.py
 def init_weights(m, mean=0.0, std=0.01):
@@ -264,6 +264,7 @@ class SourceModuleHnNSF(nn.Module):
 class Generator(nn.Module):
     def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=False):
         super(Generator, self).__init__()
+        disable_complex = True # torch compile doesn't support complex number
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
         self.m_source = SourceModuleHnNSF(
@@ -310,12 +311,8 @@ class Generator(nn.Module):
             har_spec, har_phase = self.stft.transform(har_source)
             har = torch.cat([har_spec, har_phase], dim=1) # (B, 22, )
         return har
-    def forward(self, x, s, f0):
-        # x : B, C, 2 * L0
-        # s : B, C0
-        # f0 : torch.Size([B, 2 * L0]) L0 = 581
-        # har : [1, 22, 69721] 69721 around -> 120 * L0
-        har = self.compute_har(f0)
+    
+    def forward_inner(self, x, s, har):
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, negative_slope=0.1) 
             x_source = self.noise_convs[i](har)
@@ -333,6 +330,14 @@ class Generator(nn.Module):
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
         x = self.conv_post(x)
+        return x 
+    def forward(self, x, s, f0):
+        # x : B, C, 2 * L0
+        # s : B, C0
+        # f0 : torch.Size([B, 2 * L0]) L0 = 581
+        # har : [1, 22, 69721] 69721 around -> 120 * L0
+        har = self.compute_har(f0)
+        x = self.forward_inner(x, s, har)
         spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
         return self.stft.inverse(spec, phase)
@@ -393,7 +398,7 @@ class AdainResBlk1d(nn.Module):
         out = (out + self._shortcut(x)) * torch.rsqrt(torch.tensor(2))
         return out
 
-
+@partial(torch.compile, fullgraph=True, dynamic=True)
 class Decoder(nn.Module):
     def __init__(self, dim_in, style_dim, dim_out, 
                  resblock_kernel_sizes,
