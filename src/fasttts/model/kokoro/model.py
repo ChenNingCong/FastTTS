@@ -85,82 +85,10 @@ class KModel(torch.nn.Module):
 
     def forward_bert(self, input_ids, text_mask):
         bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
-        d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
+        d_en = self.bert_encoder(bert_dur).transpose(-1, -2) # (B, C, L)
         return d_en
     
     def forward_duration(self, input_ids, input_lengths, text_mask, ref_s, speed, d_en):
-        s = ref_s[:, 128:]
-        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-        x, _ = self.predictor.lstm(d)
-        duration = self.predictor.duration_proj(x)
-        duration = torch.sigmoid(duration).sum(axis=-1) / speed
-        pred_dur = torch.round(duration).clamp(min=1).long().squeeze()
-        indices = torch.repeat_interleave(torch.arange(input_ids.shape[1], device=self.device), pred_dur)
-        pred_aln_trg = torch.zeros((input_ids.shape[1], indices.shape[0]), device=self.device)
-        pred_aln_trg[indices, torch.arange(indices.shape[0])] = 1
-        pred_aln_trg = pred_aln_trg.unsqueeze(0).to(self.device)
-        en = d.transpose(-1, -2) @ pred_aln_trg
-        F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
-        t_en = self.text_encoder(input_ids, input_lengths, text_mask)
-        asr = t_en @ pred_aln_trg
-        return asr, F0_pred, N_pred, pred_dur
-    
-    def forward_decoder(self, asr, F0_pred, N_pred, ref_s):
-        return self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze(0)
-    
-    @torch.no_grad()
-    def forward_with_tokens(
-        self,
-        input_ids: torch.LongTensor,
-        ref_s: torch.FloatTensor,
-        speed: float = 1
-    ) -> tuple[torch.FloatTensor, torch.LongTensor]:
-        input_lengths = torch.full(
-            (input_ids.shape[0],), 
-            input_ids.shape[-1], 
-            device=input_ids.device,
-            dtype=torch.long
-        )
-
-        text_mask = torch.arange(input_lengths.max()).unsqueeze(0).expand(input_lengths.shape[0], -1).type_as(input_lengths)
-        text_mask = torch.gt(text_mask+1, input_lengths.unsqueeze(1)).to(self.device)
-        dn = self.forward_bert(input_ids=input_ids, text_mask=text_mask)
-        asr, F0_pred, N_pred, pred_dur = self.forward_duration(input_ids=input_ids, 
-                                                     input_lengths=input_lengths, 
-                                                     text_mask=text_mask, 
-                                                     ref_s=ref_s, 
-                                                     speed=speed, d_en=dn)
-        audio =  self.forward_decoder(asr=asr, F0_pred=F0_pred, N_pred=N_pred, ref_s=ref_s)
-        return audio, pred_dur
-    
-    @torch.no_grad()
-    def forward_with_tokens_batched(
-        self,
-        input_ids: List[torch.LongTensor],
-        ref_s: torch.FloatTensor,
-        speed: float = 1
-    ) -> tuple[torch.FloatTensor, torch.LongTensor]:
-        assert len(input_ids) > 0 
-        assert len(input_ids) == ref_s.shape[0]
-
-        # 1. Pad the list of tensors to a uniform length
-        input_lengths = torch.tensor([len(t) for t in input_ids], device=input_ids[0].device, dtype=torch.long)
-        max_len = input_lengths.max().item()
-
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids,
-            batch_first=True,
-            padding_value=0
-        )
-
-        # 2. Correctly create the padding mask
-        # C : 512, C0 : 128, C2 : 50, L0 : expanded duration 
-        text_mask = torch.arange(max_len).unsqueeze(0).to(self.device)
-        text_mask = text_mask.expand(len(input_ids), -1)
-        text_mask = torch.gt(text_mask, input_lengths.unsqueeze(1) - 1)
-        
-        bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
-        d_en = self.bert_encoder(bert_dur).transpose(-1, -2) # (B, C, L)
         s = ref_s[:, 128:] # (B, C0)
         d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask) # (B, L, C + C0)
         # d : [batch_size, max_seq_len, hidden_size]
@@ -180,7 +108,32 @@ class KModel(torch.nn.Module):
         F0_pred, N_pred = self.predictor.F0Ntrain(en, s) # (B, 2*L0), (B, 2*L0)
         t_en = self.text_encoder(input_ids, input_lengths, text_mask) # (B, C, L)
         asr = t_en @ pred_aln_trg # (B, C, L0)
-        audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze(1)
+        return asr, F0_pred, N_pred, pred_dur
+    
+    def forward_decoder(self, asr, F0_pred, N_pred, ref_s):
+        return self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze(0)
+    
+    @torch.no_grad()
+    def forward_with_tokens(
+        self,
+        input_ids: torch.LongTensor,
+        input_lengths: torch.LongTensor,
+        ref_s: torch.FloatTensor,
+        speed: float = 1
+    ) -> tuple[torch.FloatTensor, torch.LongTensor]:
+        max_len = input_lengths.max().item()
+
+        text_mask = torch.arange(max_len).unsqueeze(0).to(self.device)
+        text_mask = text_mask.expand(len(input_ids), -1)
+        text_mask = torch.gt(text_mask, input_lengths.unsqueeze(1) - 1)
+
+        dn = self.forward_bert(input_ids=input_ids, text_mask=text_mask)
+        asr, F0_pred, N_pred, pred_dur = self.forward_duration(input_ids=input_ids, 
+                                                     input_lengths=input_lengths, 
+                                                     text_mask=text_mask, 
+                                                     ref_s=ref_s, 
+                                                     speed=speed, d_en=dn)
+        audio =  self.forward_decoder(asr=asr, F0_pred=F0_pred, N_pred=N_pred, ref_s=ref_s)
         return audio, pred_dur
 
     def forward(
@@ -195,7 +148,8 @@ class KModel(torch.nn.Module):
         assert len(input_ids)+2 <= self.context_length, (len(input_ids)+2, self.context_length)
         input_ids = torch.LongTensor([[0, *input_ids, 0]]).to(self.device)
         ref_s = ref_s.to(self.device)
-        audio, pred_dur = self.forward_with_tokens(input_ids, ref_s, speed)
+        input_lengths = torch.LongTensor([len(input_ids[0])]).to(self.device)
+        audio, pred_dur = self.forward_with_tokens(input_ids, input_lengths, ref_s, speed)
         audio = audio.squeeze().cpu()
         pred_dur = pred_dur.cpu() if pred_dur is not None else None
         logger.debug(f"pred_dur: {pred_dur}")
