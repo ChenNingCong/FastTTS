@@ -23,13 +23,15 @@ class AdaIN1d(nn.Module):
         # affine should be False, however there's a bug in the old torch.onnx.export (not newer dynamo) that causes the channel dimension to be lost if affine=False. When affine is true, there's additional learnably parameters. This shouldn't really matter setting it to True, since we're in inference mode
         self.norm = nn.InstanceNorm1d(num_features, affine=True)
         self.fc = nn.Linear(style_dim, num_features*2)
+        # self.fc is splitted into two linear maps
+        # self.fc will be deleted during runtime
+        self.fc1 = nn.Linear(style_dim, num_features)
+        self.fc2 = nn.Linear(style_dim, num_features)
 
     def forward(self, x, s):
-        h = self.fc(s)
-        h = h.view(h.size(0), h.size(1), 1)
-        gamma, beta = torch.chunk(h, chunks=2, dim=1)
+        gamma = self.fc1(s).unsqueeze(-1)
+        beta = self.fc2(s).unsqueeze(-1)
         return (1 + gamma) * self.norm(x) + beta
-
 
 class AdaINResBlock1(nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5), style_dim=64):
@@ -66,7 +68,12 @@ class AdaINResBlock1(nn.Module):
         self.alpha2 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for i in range(len(self.convs2))])
 
     def forward(self, x, s):
-        for c1, c2, n1, n2, a1, a2 in zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2):
+        return self.forward_helper(x, s)
+    
+    def forward_helper(self, x, s):
+        # note the magic number here!
+        for i in range(3):
+            c1, c2, n1, n2, a1, a2 = self.convs1[i], self.convs2[i], self.adain1[i], self.adain2[i], self.alpha1[i], self.alpha2[i]
             xt = n1(x, s)
             xt = xt + (1 / a1) * (torch.sin(a1 * xt) ** 2)  # Snake1D
             xt = c1(xt)
