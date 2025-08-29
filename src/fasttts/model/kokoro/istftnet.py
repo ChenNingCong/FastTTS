@@ -295,14 +295,20 @@ class Generator(nn.Module):
             if disable_complex
             else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
         )
-
-    def forward(self, x, s, f0):
+    def compute_har(self, f0):
         with torch.no_grad():
-            f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+            f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t # [B, upsample_L, 1]
             har_source, noi_source, uv = self.m_source(f0)
             har_source = har_source.transpose(1, 2).squeeze(1)
             har_spec, har_phase = self.stft.transform(har_source)
-            har = torch.cat([har_spec, har_phase], dim=1)
+            har = torch.cat([har_spec, har_phase], dim=1) # (B, 22, )
+        return har
+    def forward(self, x, s, f0):
+        # x : B, C, 2 * L0
+        # s : B, C0
+        # f0 : torch.Size([B, 2 * L0]) L0 = 581
+        # har : [1, 22, 69721] 69721 around -> 120 * L0
+        har = self.compute_har(f0)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, negative_slope=0.1) 
             x_source = self.noise_convs[i](har)
@@ -405,11 +411,16 @@ class Decoder(nn.Module):
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=disable_complex)
 
     def forward(self, asr, F0_curve, N, s):
-        F0 = self.F0_conv(F0_curve.unsqueeze(1))
-        N = self.N_conv(N.unsqueeze(1))
-        x = torch.cat([asr, F0, N], axis=1)
-        x = self.encode(x, s)
-        asr_res = self.asr_res(asr)
+        # asr : # (B, C, L0)
+        # F0_curve : # (B, 2*L0)
+        # N : # (B, 2*L0)
+        # s : # (B, C0)
+
+        F0 = self.F0_conv(F0_curve.unsqueeze(1)) # (B, 1, L0)
+        N = self.N_conv(N.unsqueeze(1)) # (B, 1, L0)
+        x = torch.cat([asr, F0, N], axis=1) # (B, C + 2, L0)
+        x = self.encode(x, s) # (B, 1024, L0)
+        asr_res = self.asr_res(asr) # (B, 64, L0)
         res = True
         for block in self.decode:
             if res:
