@@ -311,7 +311,7 @@ class Generator(nn.Module):
             har_spec, har_phase = self.stft.transform(har_source)
             har = torch.cat([har_spec, har_phase], dim=1) # (B, 22, )
         return har
-    
+    @partial(torch.compile, fullgraph=True, dynamic=True)
     def forward_inner(self, x, s, har):
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, negative_slope=0.1) 
@@ -398,7 +398,6 @@ class AdainResBlk1d(nn.Module):
         out = (out + self._shortcut(x)) * torch.rsqrt(torch.tensor(2))
         return out
 
-@partial(torch.compile, fullgraph=True, dynamic=True)
 class Decoder(nn.Module):
     def __init__(self, dim_in, style_dim, dim_out, 
                  resblock_kernel_sizes,
