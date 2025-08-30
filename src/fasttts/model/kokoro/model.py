@@ -138,22 +138,26 @@ class KModel(torch.nn.Module):
 
     def forward(
         self,
-        phonemes: str,
-        ref_s: torch.FloatTensor,
+        phonemes: List[str],
+        ref_s: List[torch.FloatTensor],
         speed: float = 1,
         return_output: bool = False
-    ) -> Union['KModel.Output', torch.FloatTensor]:
-        input_ids = list(filter(lambda i: i is not None, map(lambda p: self.vocab.get(p), phonemes)))
-        logger.debug(f"phonemes: {phonemes} -> input_ids: {input_ids}")
-        assert len(input_ids)+2 <= self.context_length, (len(input_ids)+2, self.context_length)
-        input_ids = torch.LongTensor([[0, *input_ids, 0]]).to(self.device)
-        ref_s = ref_s.to(self.device)
-        input_lengths = torch.LongTensor([len(input_ids[0])]).to(self.device)
+    ) -> Union[List['KModel.Output'], List[torch.Tensor]]:
+        def fn(phonemes : str) -> torch.LongTensor:
+            input_ids = list(filter(lambda i: i is not None, map(lambda p: self.vocab.get(p), phonemes)))
+            logger.debug(f"phonemes: {phonemes} -> input_ids: {input_ids}")
+            assert len(input_ids)+2 <= self.context_length, (len(input_ids)+2, self.context_length)
+            input_ids = torch.tensor([0, *input_ids, 0], device=self.device)
+            return input_ids
+        input_id_list = [fn(i) for i in phonemes]
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_id_list, batch_first=True, padding_value=0)
+        input_lengths = torch.tensor([len(i) for i in input_id_list], device=self.device)
+        ref_s = torch.cat(ref_s, 0).to(self.device)
         audio, pred_dur = self.forward_with_tokens(input_ids, input_lengths, ref_s, speed)
-        audio = audio.squeeze().cpu()
+        audio = audio.cpu()
         pred_dur = pred_dur.cpu() if pred_dur is not None else None
         logger.debug(f"pred_dur: {pred_dur}")
-        return self.Output(audio=audio, pred_dur=pred_dur) if return_output else audio
+        return [self.Output(audio=audio[i], pred_dur=pred_dur[i]) for i in range(len(phonemes))] if return_output else [audio[i] for i in range(len(phonemes))]
 
 class KModelForONNX(torch.nn.Module):
     def __init__(self, kmodel: KModel):
