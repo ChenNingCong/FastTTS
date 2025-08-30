@@ -3,10 +3,13 @@ from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
 from misaki import en, espeak
-from typing import Callable, Generator, List, Optional, Tuple, Union
+from typing import Callable, Generator, List, Optional, Tuple, Union, Awaitable
 import re
 import torch
 import os
+from ...utils.batcher import AsyncBatcher
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
 ALIASES = {
     'en-us': 'a',
@@ -39,6 +42,22 @@ LANG_CODES = dict(
     z='Mandarin Chinese',
 )
 
+class InferAsyncBatcher(AsyncBatcher):
+    def __init__(self, pipeline : 'KPipeline', *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pipeline = pipeline
+
+    def process_batch(self, batch):
+        print(f"process batch of length {len(batch)}")
+        model = self.pipeline.model
+        input_ids = [i[0] for i in batch]
+        ref_s = [i[1] for i in batch]
+        # TODO : fix the speed here !!!
+        speed = 1
+        assert model is not None
+        result = model(input_ids, ref_s, speed, return_output=True)
+        return result
+    
 class KPipeline:
     '''
     KPipeline is a language-aware support class with 2 main responsibilities:
@@ -68,7 +87,8 @@ class KPipeline:
         model: Union[KModel, bool] = True,
         trf: bool = False,
         en_callable: Optional[Callable[[str], str]] = None,
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        max_batch_size : int = 4
     ):
         """Initialize a KPipeline.
         
@@ -89,6 +109,7 @@ class KPipeline:
         assert lang_code in LANG_CODES, (lang_code, LANG_CODES)
         self.lang_code = lang_code
         self.model = None
+        self.batcher = InferAsyncBatcher(self, max_batch_size=max_batch_size, max_queue_time=0, executor=ThreadPoolExecutor(1))
         if isinstance(model, KModel):
             self.model = model
         elif model:
@@ -230,23 +251,28 @@ class KPipeline:
             ps = KPipeline.tokens_to_ps(tks)
             yield ''.join(text).strip(), ''.join(ps).strip(), tks
 
-    @staticmethod
     def infer(
+        self,
         model: KModel,
         ps: str,
         pack: torch.FloatTensor,
-        speed: Union[float, Callable[[int], float]] = 1
-    ) -> KModel.Output:
+        speed: Union[float, Callable[[int], float]] = 1,
+        is_sync : bool = False
+    ) -> Awaitable[KModel.Output] | KModel.Output:
         if callable(speed):
             speed = speed(len(ps))
-        return model(ps, pack[len(ps)-1], speed, return_output=True)
+        if is_sync:
+            return model([ps], [pack[len(ps)-1]], speed, return_output=True)[0]
+        else:
+            return self.batcher.process((ps, pack[len(ps)-1], speed))
 
     def generate_from_tokens(
         self,
         tokens: Union[str, List[en.MToken]],
         voice: str,
         speed: float = 1,
-        model: Optional[KModel] = None
+        model: Optional[KModel] = None,
+        is_sync : bool = False
     ) -> Generator['KPipeline.Result', None, None]:
         """Generate audio from either raw phonemes or pre-processed tokens.
         
@@ -273,7 +299,7 @@ class KPipeline:
             logger.debug("Processing phonemes from raw string")
             if len(tokens) > 510:
                 raise ValueError(f'Phoneme string too long: {len(tokens)} > 510')
-            output = KPipeline.infer(model, tokens, pack, speed) if model else None
+            output = self.infer(model, tokens, pack, speed, is_sync=is_sync) if model else None
             yield self.Result(graphemes='', phonemes=tokens, output=output)
             return
         
@@ -286,9 +312,9 @@ class KPipeline:
                 logger.warning(f"Unexpected len(ps) == {len(ps)} > 510 and ps == '{ps}'")
                 logger.warning("Truncating to 510 characters")
                 ps = ps[:510]
-            output = KPipeline.infer(model, ps, pack, speed) if model else None
-            if output is not None and output.pred_dur is not None:
-                KPipeline.join_timestamps(tks, output.pred_dur)
+            output = self.infer(model, ps, pack, speed, is_sync=is_sync) if model else None
+            # if output is not None and output.pred_dur is not None:
+            #     KPipeline.join_timestamps(tks, output.pred_dur)
             yield self.Result(graphemes=gs, phonemes=ps, tokens=tks, output=output)
 
     @staticmethod
@@ -334,16 +360,32 @@ class KPipeline:
         graphemes: str
         phonemes: str
         tokens: Optional[List[en.MToken]] = None
-        output: Optional[KModel.Output] = None
+        output: Optional[Awaitable[KModel.Output] | KModel.Output] = None
         text_index: Optional[int] = None
 
         @property
-        def audio(self) -> Optional[torch.FloatTensor]:
-            return None if self.output is None else self.output.audio
+        def audio(self):
+            output = self.output
+            if output is None:
+                return None
+            if asyncio.iscoroutinefunction(output):
+                async def get_audio():
+                    return (await output).audio
+                return get_audio()
+            else:
+                return output.audio
 
         @property
-        def pred_dur(self) -> Optional[torch.LongTensor]:
-            return None if self.output is None else self.output.pred_dur
+        def pred_dur(self):
+            output = self.output
+            if output is None:
+                return None
+            if asyncio.iscoroutinefunction(output):
+                async def get_pred_dur():
+                    return (await output).pred_dur
+                return get_pred_dur()
+            else:
+                return output.pred_dur
 
         ### MARK: BEGIN BACKWARD COMPAT ###
         def __iter__(self):
@@ -364,7 +406,8 @@ class KPipeline:
         voice: Optional[str] = None,
         speed: Union[float, Callable[[int], float]] = 1,
         split_pattern: Optional[str] = r'\n+',
-        model: Optional[KModel] = None
+        model: Optional[KModel] = None,
+        is_sync : bool = False
     ) -> Generator['KPipeline.Result', None, None]:
         model = model or self.model
         if model and voice is None:
@@ -390,9 +433,9 @@ class KPipeline:
                     elif len(ps) > 510:
                         logger.warning(f"Unexpected len(ps) == {len(ps)} > 510 and ps == '{ps}'")
                         ps = ps[:510]
-                    output = KPipeline.infer(model, ps, pack, speed) if model else None
-                    if output is not None and output.pred_dur is not None:
-                        KPipeline.join_timestamps(tks, output.pred_dur)
+                    output = self.infer(model, ps, pack, speed, is_sync=is_sync) if model else None
+                    # if output is not None and output.pred_dur is not None:
+                    #     KPipeline.join_timestamps(tks, output.pred_dur)
                     yield self.Result(graphemes=gs, phonemes=ps, tokens=tks, output=output, text_index=graphemes_index)
             
             # Non-English processing with chunking
@@ -438,5 +481,5 @@ class KPipeline:
                         logger.warning(f'Truncating len(ps) == {len(ps)} > 510')
                         ps = ps[:510]
                         
-                    output = KPipeline.infer(model, ps, pack, speed) if model else None
+                    output = self.infer(model, ps, pack, speed, is_sync=is_sync) if model else None
                     yield self.Result(graphemes=chunk, phonemes=ps, output=output, text_index=graphemes_index)
