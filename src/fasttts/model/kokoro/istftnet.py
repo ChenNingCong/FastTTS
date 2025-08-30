@@ -255,6 +255,8 @@ class SourceModuleHnNSF(nn.Module):
         # source for harmonic branch
         with torch.no_grad():
             sine_wavs, uv, _ = self.l_sin_gen(x)
+            sine_wavs = sine_wavs.to(self.l_linear.weight.dtype)
+            uv = uv.to(self.l_linear.weight.dtype)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         # source for noise branch, in the same shape as uv
         noise = torch.randn_like(uv) * self.sine_amp / 3
