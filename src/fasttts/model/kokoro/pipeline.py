@@ -10,6 +10,7 @@ import os
 from ...utils.batcher import AsyncBatcher
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+import sys
 
 ALIASES = {
     'en-us': 'a',
@@ -49,6 +50,7 @@ class InferAsyncBatcher(AsyncBatcher):
 
     def process_batch(self, batch):
         print(f"process batch of length {len(batch)}")
+        sys.stdout.flush()
         model = self.pipeline.model
         input_ids = [i[0] for i in batch]
         ref_s = [i[1] for i in batch]

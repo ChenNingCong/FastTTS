@@ -90,7 +90,7 @@ class AsyncBatcher(Generic[T, S], abc.ABC):
         This method should be overridden by the user to define how to process a batch of items.
         """
 
-    async def process(self, item: T) -> S:
+    def process(self, item: T):
         """Add an item to the queue and get the result when it's ready.
 
         Args:
@@ -107,9 +107,12 @@ class AsyncBatcher(Generic[T, S], abc.ABC):
         future = asyncio.get_running_loop().create_future()
         if self._queue.full():
             raise QueueFullException("The queue is full, cannot process more items at the moment.")
-        await self._queue.put(self.QueueItem(item, future))
-        await future
-        return future.result()
+        # add a item to the queue
+        asyncio.get_running_loop().create_task(self._queue.put(self.QueueItem(item, future)))
+        async def get_future():
+            await future
+            return future.result()
+        return get_future()
 
     async def _fill_batch_from_queue(self, started_at: float | None) -> list[QueueItem]:
         try:
