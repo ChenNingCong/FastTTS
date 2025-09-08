@@ -6,6 +6,7 @@ import soundfile as sf
 import os
 import argparse
 import torch
+from .voice import CHOICES
 
 def generate(pipeline : 'KPipeline', text : str, voice : str, speed : float):
     result = []
@@ -16,25 +17,19 @@ def generate(pipeline : 'KPipeline', text : str, voice : str, speed : float):
 class TextToSpeechApp:
     def __init__(self, compiled_dir : str, output_dir : str | None):
         # Initialize Kokoro
-        self.pipeline = None
+        self.voices = list(CHOICES.values())
+        from .compiler import init
+        self.pipeline = init(compiled_dir, "cuda")
+        for i in self.voices:
+            self.pipeline.load_voice(i)
+
         self.compiled_dir = compiled_dir
         self.output_dir = output_dir
         
-        # Available voices
-        self.voices = [
-            'af_bella', 'af_nicole', 'af_sarah', 'af_sky',
-            'am_adam', 'am_michael', 'bf_emma', 'bf_isabella',
-            'bm_george', 'bm_lewis'
-        ]
-
     def generate_speech(self, text, voice, speed, dtype:str):
         pipeline = self.pipeline
-        if pipeline is None:
-            gr.Info("Compiling model... this may take up to a minute.")
-            from .compiler import init
-            pipeline = self.pipeline = init(self.compiled_dir, "cuda")
         try:
-            result = generate(pipeline, text, voice=voice, speed=float(speed))
+            result = generate(pipeline, text, voice=CHOICES[voice], speed=float(speed))
             # Create temporary file
             output_dir = self.output_dir
             if output_dir is not None:
@@ -55,7 +50,7 @@ class TextToSpeechApp:
             fn=self.generate_speech,
             inputs=[
                 gr.Textbox(label="Enter text to convert", lines=5),
-                gr.Dropdown(choices=self.voices, label="Select Voice", value=self.voices[0]),
+                gr.Dropdown(choices=list(CHOICES.keys()), label="Select Voice", value=list(CHOICES.keys())[0]),
                 gr.Slider(minimum=0.5, maximum=2.0, value=1.0, step=0.1, label="Speech Speed"),
                 gr.Dropdown(choices=["bfloat16", "float32"],label="Select a data type", value="bfloat16"),
             ],
