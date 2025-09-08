@@ -45,7 +45,7 @@ class DynamicModel(torch.nn.Module):
 def compile_generator(g : Generator, dtype, device : str,  output_dir : str):
     from torch.export import Dim
     C0 =128
-    B = 1
+    B = BS
     C= 512
     L0 = 581
     x = torch.randn(B,C,2*L0).cuda().to(dtype)
@@ -89,7 +89,7 @@ def apply_generator_fix(pipeline:KPipeline, path):
     compiled_model = torch._inductor.aoti_load_package(path)
     pipeline.model.decoder.generator.model.forward_inner = compiled_model
 
-def init(compiled_dir : str, device : str):
+def init(compiled_dir : str, device : str, batched_input : bool = False):
     torch.set_float32_matmul_precision('high')
     from fasttts.model.kokoro.fix import apply_fix
     pipeline = KPipeline(lang_code='a')
@@ -101,9 +101,11 @@ def init(compiled_dir : str, device : str):
     compile_binary = os.path.join(compiled_dir, "generator.pt2")
     if not os.path.exists(compiled_dir):
         raise FileNotFoundError(f"{compiled_dir} is not a valid directory!")
-    if not os.path.exists(compile_binary):
-        compile_generator(pipeline.model.decoder.generator.model, dtype=torch.bfloat16, output_dir=compiled_dir, device=device)
-    apply_generator_fix(pipeline, compile_binary)
+    if not batched_input:
+        # currently we don't support compiler for batched input
+        if not os.path.exists(compile_binary):
+            compile_generator(pipeline.model.decoder.generator.model, dtype=torch.bfloat16, output_dir=compiled_dir, device=device)
+        apply_generator_fix(pipeline, compile_binary)
     return pipeline
 
 
