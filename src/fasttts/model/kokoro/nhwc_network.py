@@ -53,7 +53,34 @@ def my_custom_convolution2d_forward(
     outputDataType
 )
 
+def my_custom_convolution2d_forward_with_bias(
+    input_tensor: torch.Tensor,
+    weight_tensor: torch.Tensor,
+    bias_tensor : torch.Tensor,
+    padding: List[int],
+    stride: List[int],
+    upscale: List[int],
+    groups: int,
+    allow_tf32: bool,
+    dataType: 'cudnnDataType_t',
+    mathType: 'cudnnMathType_t',
+    outputDataType: 'cudnnDataType_t'
+):
+    return custom_conv_ext.my_custom_convolution2d_forward_with_bias(
+    input_tensor,
+    weight_tensor,
+    bias_tensor,
+    padding,
+    stride,
+    upscale,
+    groups,
+    allow_tf32,
+    dataType,
+    mathType,
+    outputDataType
+)
 
+@torch.library.custom_op("custom_conv_ext::conv1d", mutates_args=())
 def conv1d(
     input: Tensor,
     weight: Tensor,
@@ -61,9 +88,11 @@ def conv1d(
     stride: int,
     padding: int,
     dilation: int,
-):
+) -> Tensor:
     input_tensor = input.unsqueeze(1)
     weight_tensor = weight.unsqueeze(1)
+    bias_tensor = bias
+    assert bias_tensor.dim() == 1
     assert input.is_contiguous()
     assert weight_tensor.is_contiguous()
     assert input.is_cuda
@@ -78,9 +107,10 @@ def conv1d(
         outputDataType=cudnnDataType_t.CUDNN_DATA_FLOAT
     else:
         assert False
-    custom_output = my_custom_convolution2d_forward(
+    custom_output = my_custom_convolution2d_forward_with_bias(
         input_tensor,
         weight_tensor,
+        bias_tensor,
         [0, padding],
         [1, stride],
         [1, dilation],
@@ -90,7 +120,7 @@ def conv1d(
         mathType=mathType,
         outputDataType=outputDataType,
     )
-    return custom_output.squeeze(1) + bias
+    return custom_output.squeeze(1)
 
 class NHWCConv1d(nn.Conv1d):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int | tuple[int], stride: int | tuple[int] = 1, padding: str | int | tuple[int] = 0, dilation: int | tuple[int] = 1, groups: int = 1, bias: bool = True, padding_mode: str = "zeros", device=None, dtype=None) -> None:

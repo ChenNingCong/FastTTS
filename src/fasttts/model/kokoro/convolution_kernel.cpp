@@ -140,10 +140,113 @@ at::Tensor my_custom_convolution2d_forward(
   return output;
 }
 
+at::Tensor my_custom_convolution2d_forward_with_bias(
+   const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias,
+   const std::vector<int32_t> &padding, const std::vector<int32_t> &stride,
+   const std::vector<int32_t> &upscale, const int groups,
+   const bool allow_tf32, const cudnnDataType_t dataType,
+   const cudnnMathType_t mathType, const cudnnDataType_t outputDataType) {
+ cudnnHandle_t handle = at::native::getCudnnHandle();
+ // Create descriptors
+ at::native::TensorDescriptor input_desc;
+ at::native::FilterDescriptor weight_desc;
+ at::native::TensorDescriptor output_desc;
+ at::native::TensorDescriptor bias_desc; // Descriptor for bias
+ at::native::ConvolutionDescriptor conv_desc;
+ at::native::ActivationDescriptor activation_desc; // For activation fusion
+
+ // n, h, w, in_c
+ AT_CUDNN_CHECK(cudnnSetTensor4dDescriptor(
+     input_desc.mut_desc(), CUDNN_TENSOR_NHWC, getDataType(input),
+     input.size(0), input.size(3), input.size(1), input.size(2)));
+ // Set filter type
+ // out_c, kernel_h, kernel_w, in_c
+ AT_CUDNN_CHECK(cudnnSetFilter4dDescriptor(
+     weight_desc.mut_desc(), getDataType(input), CUDNN_TENSOR_NHWC,
+     weight.size(0), weight.size(3), weight.size(1), weight.size(2)));
+ 
+ // Set bias tensor descriptor
+ // The bias tensor must be a 1D tensor with a size equal to the number of output channels.
+ // cuDNN expects a 4D tensor with dimensions 1, num_channels, 1, 1 for CUDNN_TENSOR_NHWC format.
+ AT_CUDNN_CHECK(cudnnSetTensor4dDescriptor(
+     bias_desc.mut_desc(), CUDNN_TENSOR_NHWC, getDataType(bias),
+     1, bias.size(0), 1, 1));
+
+ // Set cudnn convolution type
+ const int dim = 2;
+ // we can also use cudnnSetConvolution2dDescriptor
+ AT_CUDNN_CHECK(cudnnSetConvolutionNdDescriptor(
+     conv_desc.mut_desc(), dim, const_cast<int *>(padding.data()),
+     const_cast<int *>(stride.data()), const_cast<int *>(upscale.data()),
+     CUDNN_CROSS_CORRELATION, dataType));
+ AT_CUDNN_CHECK(cudnnSetConvolutionGroupCount(conv_desc.mut_desc(), groups));
+ // See Note [behavior of cudnnFind and cudnnGet]
+ AT_CUDNN_CHECK(cudnnSetConvolutionMathType(conv_desc.mut_desc(), mathType));
+
+ // Determine output size
+ // output
+ int out_n;
+ int out_c;
+ int out_h;
+ int out_w;
+
+ CUDNN_CALL(cudnnGetConvolution2dForwardOutputDim(
+     conv_desc.mut_desc(), input_desc.mut_desc(), weight_desc.mut_desc(),
+     &out_n, &out_c, &out_h, &out_w));
+
+ // Create output tensor and set description
+ at::Tensor output =
+     at::empty({out_n, out_h, out_w, out_c},
+               input.options().dtype(getScalarType(outputDataType)));
+ AT_CUDNN_CHECK(cudnnSetTensor4dDescriptor(output_desc.mut_desc(),
+                                           CUDNN_TENSOR_NHWC, outputDataType,
+                                           out_n, out_c, out_h, out_w));
+
+ // No activation function, so we'll use CUDNN_ACTIVATION_IDENTITY
+ AT_CUDNN_CHECK(cudnnSetActivationDescriptor(
+     activation_desc.mut_desc(), CUDNN_ACTIVATION_IDENTITY, CUDNN_PROPAGATE_NAN, 0.0));
+
+
+ // algorithm
+ cudnnConvolutionFwdAlgo_t algo;
+ // CUDNN_CALL(cudnnGetConvolutionForwardAlgorithm(
+ //       handle,
+ //       input_desc.mut_desc(), weight_desc.mut_desc(), conv_desc.mut_desc(),
+ //       output_desc.mut_desc(), CUDNN_CONVOLUTION_FWD_PREFER_FASTEST, 0,
+ //       &algo));
+ algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+
+ std::cout << "Convolution algorithm: " << algo << std::endl;
+ std::cout << std::endl;
+
+ // Determine workspace size
+ size_t workspace_size = 0;
+ AT_CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
+     handle, input_desc.desc(), weight_desc.desc(), conv_desc.desc(),
+     output_desc.desc(), algo, &workspace_size));
+
+ // Allocate workspace
+ at::Tensor workspace =
+     at::empty(workspace_size, input.options().dtype(at::kByte));
+
+ // Call cuDNN
+ float alpha = 1.0f;
+ float beta = 0.0f;
+ AT_CUDNN_CHECK(cudnnConvolutionBiasActivationForward(
+     handle, &alpha, input_desc.desc(), input.data_ptr(), weight_desc.desc(),
+     weight.data_ptr(), conv_desc.desc(), algo, workspace.data_ptr(),
+     workspace_size, &beta, output_desc.desc(), output.data_ptr(),
+     bias_desc.desc(), bias.data_ptr(), activation_desc.desc(),
+     output_desc.desc(), output.data_ptr()));
+ return output;
+}
+
 // Bind the C++ function to a Python module
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("my_custom_convolution2d_forward", &my_custom_convolution2d_forward,
         "Custom Convolution Forward NHWC format (CUDA)");
+  m.def("my_custom_convolution2d_forward_with_bias", &my_custom_convolution2d_forward_with_bias,
+        "Custom Convolution Forward NHWC format (CUDA), with bias");
   py::enum_<cudnnDataType_t>(m, "cudnnDataType_t")
       .value("CUDNN_DATA_FLOAT", cudnnDataType_t::CUDNN_DATA_FLOAT)
       .value("CUDNN_DATA_DOUBLE", cudnnDataType_t::CUDNN_DATA_DOUBLE)
