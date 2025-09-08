@@ -15,7 +15,7 @@ dependencies = [
     "loguru",
     "misaki[en]>=0.9.4",
     "numpy",
-    "torch",
+    "torch[cuda]>=2.7.0",
     "transformers"
 ]
 readme = "README.md"
